@@ -53,22 +53,23 @@ class GlitchKitSimple(TargetTemplate):
 
     # Types of edge-sensitive triggers. Should match the sensitivity enum in GreatFET's gpio_int.h.
     EDGE_TRIGGER_MODES = {
-        'Disabled':    -1,
-        'Rising Edge':  2,
-        'Falling Edge': 3,
-        'Both Edges':   4
+        'Disabled':     'DISABLED',
+        'Rising Edge':  'EDGE_RISING',
+        'Falling Edge': 'EDGE_FALLING',
+        'Both Edges':   'EDGE_BOTH'
     }
 
     # Types of level-sensitive triggers. Should match the sensitivity enum in GreatFET's gpio_int.h.
     LEVEL_TRIGGER_MODES = {
-        'Disabled':    -1,
-        'High':         0,
-        'Low':          1
+        'Disabled':     'DISABLED',
+        'High':         'LEVEL_HIGH',
+        'Low':          'LEVEL_LOW'
     }
 
     # We currently support up to 8 conditions for simple triggers.
     # This can be arbitrarily upped in the GreatFET firmware.
-    MAX_CONDITIONS = 8
+    MAX_EDGE_CONDITIONS  = 8
+    MAX_LEVEL_CONDITIONS = 8
 
 
     def _add_condition_params(self, param_path, number, trigger_types, expanded=False):
@@ -77,8 +78,8 @@ class GlitchKitSimple(TargetTemplate):
         # Add the nodes to our UI...
         param.addChildren([
             {'name': 'Condition {}'.format(number), 'key': '{}'.format(number), 'type': 'group', 'expanded': expanded, 'children': [
-                {'name': 'Edge',  'key':'mode',  'type':'list', 'values': trigger_types,       'value': trigger_types[0]},
-                {'name': 'Input', 'key':'input', 'type':'list', 'values': self.available_pins, 'value': self.available_pins[0]}
+                {'name': 'Edge',  'key':'mode',  'type':'list', 'values': trigger_types,       'value': trigger_types[0], 'action': self._update_condition_list},
+                {'name': 'Input', 'key':'input', 'type':'list', 'values': self.available_pins, 'value': self.available_pins[0], 'action': self._update_condition_list}
             ]}
         ])
 
@@ -93,18 +94,21 @@ class GlitchKitSimple(TargetTemplate):
         self.greatfet = None
         self.pin_fields = []
         self.available_pins = ['-']
+        self.condition_list = None
 
         # Create the skeleton for our dialog...
         self.params.addChildren([
             {'name': 'Trigger Mode', 'key':'mode', 'type':'list', 'values': self.TRIGGER_MODES, 'value': self.TRIGGER_MODES[0]},
+            {'name': 'Target Count', 'key':'count', 'type':'int', 'range': (0, (2**32) - 1), 'step': 1, 'value': 10},
             {'name': 'Trigger Output', 'key':'trigger_out', 'type':'list', 'values': self.TRIGGER_OUTPUT_MODES, 'value': self.TRIGGER_OUTPUT_MODES[0]},
             {'name': 'Edge Triggers (OR\'d)', 'key':'edges', 'type':'group', 'expanded':True, 'children':[]},
             {'name': 'Level Triggers (AND\'d)', 'key':'levels', 'type':'group', 'expanded':True, 'children':[]},
         ])
 
         # Add each of our condition fields...
-        for i in range(self.MAX_CONDITIONS):
+        for i in range(self.MAX_EDGE_CONDITIONS):
             self._add_condition_params(['edges'], i + 1, self.EDGE_TRIGGER_MODES.keys(), i == 0)
+        for i in range(self.MAX_LEVEL_CONDITIONS):
             self._add_condition_params(['levels'], i + 1, self.LEVEL_TRIGGER_MODES.keys(), i == 0)
 
 
@@ -117,6 +121,9 @@ class GlitchKitSimple(TargetTemplate):
         # Grab the list of available pins we can used.
         self.available_pins = sorted(self.greatfet.gpio.get_available_pins())
         self.update_available_pin_list()
+
+        # ... and grab the trigger module we'll be using.
+        self.trigger_module = self.greatfet.glitchkit.simple
 
 
     def update_available_pin_list(self):
@@ -132,13 +139,86 @@ class GlitchKitSimple(TargetTemplate):
     def close(self):
         pass
 
+
+
+    def _get_data_for_condition(self, type, number):
+        """
+        Fetches data relevant to a given condition.
+
+        Args:
+            type -- The type of condition to read. Should be 'edges' or 'levels', to match the UI.
+            number -- The condition number to read. Should match the number in the UI.
+
+        Returns:
+            [(mode, pin)] -- A list containing the 2-tuple
+                provided to the GlitchKit python library to trigger the given event.
+        """
+
+        # Figure out which mode collection we should be looking in.
+        collection = self.EDGE_TRIGGER_MODES if type == 'edges' else self.LEVEL_TRIGGER_MODES
+
+        # Get the raw values for the relevant input.
+        raw_mode = self.findParam([type, '{}'.format(number), 'mode']).getValue()
+        raw_pin  = self.findParam([type, '{}'.format(number), 'input']).getValue()
+
+        # For simplicity, if this isn't a valid entry, don't include it in the list.
+        if (raw_mode == 'Disabled') or (raw_pin == '-'):
+            return []
+
+        # Convert the mode to the string accepted by the GreatFET UI.
+        mode = collection[raw_mode]
+
+        return [(mode, raw_pin)]
+
+
+    def _build_condition_list(self):
+        """
+        Builds a condition list that encapsulates the UI in a way that
+        can be understood by the GreatFET/GlitchKit API.
+
+        Returns:
+            a condition list suitable for passing to prime_trigger_on_event_count.
+        """
+
+        # Start a new list of conditions.
+        conditions = []
+
+        # Iterate over all of the UI elements, and grab their values.
+        for i in range(self.MAX_EDGE_CONDITIONS):
+            conditions.extend(self._get_data_for_condition('edges',  i + 1))
+            conditions.extend(self._get_data_for_condition('levels', i + 1))
+
+        return conditions
+
+
+    def _update_condition_list(self, _=None):
+        """
+        Marks the condition list as no longer valid. Should be called whenever the
+        UI options change.
+        """
+        self.condition_list = self._build_condition_list()
+
+        print("New list: {}".format(self.condition_list))
+
+
+    def readOutput(self):
+        # TODO:
+        # Run a python script to generate a result, and post it to the
+        # glitch monitor? Or is this doable enough with just the Aux panel?
+
+        # Always return none, as we don't participate in the encryption/CPA.
+        return None
+
+
     def go(self):
-        pass
+        """
+        Runs a single trigger iteration.
+        """
 
-        #target_count = self.findParam(['trigger', 'count']).getValue()
+        # Grab the non-condition paramters. The condition parameters should be automatically
+        # squeezed into self.condition_list on any update, to avoid read spurts.
+        target_count = self.findParam(['count']).getValue()
 
-        #target_port = self.findParam(['trigger', 'port' ]).getValue()
-        #target_pin = self.findParam(['trigger', 'pin']).getValue()
-        #port_and_pin = (target_port << 8) | target_pin
+        # ... and prime the trigger.
+        self.trigger_module.prime_trigger_on_event_count(target_count, self.condition_list)
 
-        #self.greatfet.vendor_request_out(vendor_requests.GLITCHKIT_SIMPLE_SETUP, index=port_and_pin, value=target_count)
